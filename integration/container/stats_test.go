@@ -1,17 +1,25 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"os/exec"
 	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	containertypes "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/integration/internal/network"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -92,4 +100,97 @@ func TestStatsContainerNotFound(t *testing.T) {
 			assert.ErrorContains(t, err, "no-such-container")
 		})
 	}
+}
+
+func TestStatsNetworkStats(t *testing.T) {
+	isWindows := testEnv.DaemonInfo.OSType == "windows"
+	skip.If(t, isWindows)
+
+	ctx := setupTest(t)
+
+	apiClient := testEnv.APIClient()
+
+	id := container.Run(ctx, t, apiClient)
+	poll.WaitOn(t, container.IsInState(ctx, apiClient, id, containertypes.StateRunning), poll.WithTimeout(10*time.Second))
+
+	var preRxPackets uint64
+	var preTxPackets uint64
+	var postRxPackets uint64
+	var postTxPackets uint64
+
+	net := "bridge"
+	if testEnv.DaemonInfo.OSType == "windows" {
+		net = "nat"
+	}
+
+	numPings := 1
+	containerIP := findContainerIP(ctx, t, apiClient, id, net)
+
+	// Get the container networking stats before and after pinging the container
+	nwStatsPre := getNetworkStats(ctx, t, apiClient, id)
+	for _, v := range nwStatsPre {
+		preRxPackets += v.RxPackets
+		preTxPackets += v.TxPackets
+	}
+
+	countParam := "-c"
+	if runtime.GOOS == "windows" {
+		countParam = "-n" // Ping count parameter is -n on Windows
+	}
+
+	pingout, err := exec.Command("ping", containerIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
+	if err != nil && runtime.GOOS == "linux" {
+		// If it fails then try a work-around, but just for linux.
+		// If this fails too then go back to the old error for reporting.
+		//
+		// The ping will sometimes fail due to an apparmor issue where it
+		// denies access to the libc.so.6 shared library - running it
+		// via /lib64/ld-linux-x86-64.so.2 seems to work around it.
+		pingout2, err2 := exec.Command("/lib64/ld-linux-x86-64.so.2", "/bin/ping", containerIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
+		if err2 == nil {
+			pingout = pingout2
+			err = err2
+		}
+	}
+	assert.NilError(t, err, string(pingout))
+	pingouts := string(pingout[:])
+	nwStatsPost := getNetworkStats(ctx, t, apiClient, id)
+	for _, v := range nwStatsPost {
+		postRxPackets += v.RxPackets
+		postTxPackets += v.TxPackets
+	}
+
+	// Verify the stats contain at least the expected number of packets
+	// On Linux, account for ARP.
+	expRxPkts := preRxPackets + uint64(numPings)
+	expTxPkts := preTxPackets + uint64(numPings)
+	if testEnv.DaemonInfo.OSType != "windows" {
+		expRxPkts++
+		expTxPkts++
+	}
+
+	assert.Assert(t, postTxPackets >= expTxPkts, "Reported less TxPackets than expected. Expected >= %d. Found %d. %s", expTxPkts, postTxPackets, pingouts)
+	assert.Assert(t, postRxPackets >= expRxPkts, "Reported less RxPackets than expected. Expected >= %d. Found %d. %s", expRxPkts, postRxPackets, pingouts)
+}
+
+func getNetworkStats(ctx context.Context, t *testing.T, apiClient client.APIClient, id string) map[string]containertypes.NetworkStats {
+	res, err := apiClient.ContainerStats(ctx, id, client.ContainerStatsOptions{Stream: false})
+	assert.NilError(t, err)
+
+	var st containertypes.StatsResponse
+	err = json.NewDecoder(res.Body).Decode(&st)
+
+	assert.NilError(t, err)
+	_ = res.Body.Close()
+
+	return st.Networks
+}
+
+func findContainerIP(ctx context.Context, t *testing.T, apiClient client.APIClient, containerId string, net string) string {
+	t.Helper()
+
+	res, err := network.Inspect(ctx, apiClient, net, client.NetworkInspectOptions{})
+	assert.NilError(t, err)
+
+	return strings.TrimSpace(res.Network.Containers[containerId].IPv4Address.Addr().String())
 }

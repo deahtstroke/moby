@@ -8,18 +8,14 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
-	"strings"
 	"testing"
-	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	containertypes "github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/v2/integration/internal/container"
-	"github.com/moby/moby/v2/integration/internal/network"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
-	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -110,24 +106,26 @@ func TestStatsNetworkStats(t *testing.T) {
 
 	apiClient := testEnv.APIClient()
 
-	id := container.Run(ctx, t, apiClient)
-	poll.WaitOn(t, container.IsInState(ctx, apiClient, id, containertypes.StateRunning), poll.WithTimeout(10*time.Second))
+	cID := container.Run(ctx, t, apiClient)
 
-	var preRxPackets uint64
-	var preTxPackets uint64
-	var postRxPackets uint64
-	var postTxPackets uint64
+	var (
+		preRxPackets  uint64
+		preTxPackets  uint64
+		postRxPackets uint64
+		postTxPackets uint64
+	)
 
 	net := "bridge"
 	if testEnv.DaemonInfo.OSType == "windows" {
 		net = "nat"
 	}
 
-	numPings := 1
-	containerIP := findContainerIP(ctx, t, apiClient, id, net)
+	res, err := apiClient.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
+	assert.NilError(t, err)
+	containerIP := res.Container.NetworkSettings.Networks[net].IPAddress.String()
 
 	// Get the container networking stats before and after pinging the container
-	nwStatsPre := getNetworkStats(ctx, t, apiClient, id)
+	nwStatsPre := getNetworkStats(ctx, t, apiClient, cID)
 	for _, v := range nwStatsPre {
 		preRxPackets += v.RxPackets
 		preTxPackets += v.TxPackets
@@ -138,6 +136,7 @@ func TestStatsNetworkStats(t *testing.T) {
 		countParam = "-n" // Ping count parameter is -n on Windows
 	}
 
+	numPings := 1
 	pingout, err := exec.Command("ping", containerIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
 	if err != nil && runtime.GOOS == "linux" {
 		// If it fails then try a work-around, but just for linux.
@@ -146,15 +145,11 @@ func TestStatsNetworkStats(t *testing.T) {
 		// The ping will sometimes fail due to an apparmor issue where it
 		// denies access to the libc.so.6 shared library - running it
 		// via /lib64/ld-linux-x86-64.so.2 seems to work around it.
-		pingout2, err2 := exec.Command("/lib64/ld-linux-x86-64.so.2", "/bin/ping", containerIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
-		if err2 == nil {
-			pingout = pingout2
-			err = err2
-		}
+		pingout, err = exec.Command("/lib64/ld-linux-x86-64.so.2", "/bin/ping", containerIP, countParam, strconv.Itoa(numPings)).CombinedOutput()
 	}
 	assert.NilError(t, err, string(pingout))
 	pingouts := string(pingout[:])
-	nwStatsPost := getNetworkStats(ctx, t, apiClient, id)
+	nwStatsPost := getNetworkStats(ctx, t, apiClient, cID)
 	for _, v := range nwStatsPost {
 		postRxPackets += v.RxPackets
 		postTxPackets += v.TxPackets
@@ -184,13 +179,4 @@ func getNetworkStats(ctx context.Context, t *testing.T, apiClient client.APIClie
 	_ = res.Body.Close()
 
 	return st.Networks
-}
-
-func findContainerIP(ctx context.Context, t *testing.T, apiClient client.APIClient, containerId string, net string) string {
-	t.Helper()
-
-	res, err := network.Inspect(ctx, apiClient, net, client.NetworkInspectOptions{})
-	assert.NilError(t, err)
-
-	return strings.TrimSpace(res.Network.Containers[containerId].IPv4Address.Addr().String())
 }
